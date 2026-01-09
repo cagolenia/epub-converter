@@ -1,0 +1,21 @@
+# EPUB to PDF Converter - Dependencies
+
+# Core EPUB parsing library
+ebooklib>=0.18
+
+# PDF generation library
+weasyprint>=60.0
+
+# HTML/XML parsing
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Additional dependencies for WeasyPrint
+cffi>=1.15.0
+cssselect2>=0.7.0
+pycairo>=1.20.0; platform_system != "Windows"
+pyphen>=0.14.0
+tinycss2>=1.2.0

@@ -370,7 +370,7 @@ This project is provided as-is for educational and personal use.
 
 ## Credits
 
-**Author:** Cezary Golenia
+**Author:** cagoleniawrite  
 **Version:** 1.0  
 **Date:** January 2026
 

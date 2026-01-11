@@ -3,7 +3,7 @@
 EPUB to PDF Converter
 A command-line tool to convert EPUB files to PDF format.
 
-Author: Cezary Golenia
+Author: cagoleniawrite
 Version: 1.0
 Date: 2026-01-05
 """
@@ -42,8 +42,9 @@ except ImportError:
 class EPUBConverter:
     """Main converter class for EPUB to PDF conversion."""
     
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, preserve_temp: bool = False):
         self.verbose = verbose
+        self.preserve_temp = preserve_temp
         self.temp_dir = None
         
     def log(self, message: str, level: str = "INFO"):
@@ -294,9 +295,91 @@ class EPUBConverter:
         .chapter {{
             page-break-before: always;
         }}
-        """
+        
+        /* Table of Contents styling */
+        .toc-page {{
+            page-break-after: always;
+        }}
+        
+        .toc-title {{
+            font-size: {font_size * 1.8}pt;
+            font-weight: bold;
+            text-align: center;
+            margin-bottom: 1em;
+            text-indent: 0;
+        }}
+        
+        .toc-list {{
+            list-style: none;
+            padding-left: 0;
+        }}
+        
+        .toc-list li {{
+            margin: 0.5em 0;
+            text-indent: 0;
+        }}
+        
+        .toc-level-1 {{
+            font-weight: bold;
+            margin-top: 0.8em;
+        }}
+        
+        .toc-level-2 {{
+            padding-left: 1.5em;
+        }}
+        
+        .toc-level-3 {{
+            padding-left: 3em;
+            font-size: 0.95em;
+        }}
+        
+        .toc-list a {{
+            color: #000;
+            text-decoration: none;
+            display: block;
+        }}
+        
+        .toc-list a:hover {{
+            color: #0066cc;
+        }}        """
         
         return css
+    
+    def extract_toc(self, book: epub.EpubBook) -> List[Tuple[str, str, int]]:
+        """
+        Extract table of contents from EPUB.
+        
+        Args:
+            book: EpubBook object
+            
+        Returns:
+            List of tuples (title, href, level)
+        """
+        toc_entries = []
+        
+        def process_toc_item(item, level=1):
+            if isinstance(item, tuple):
+                # Item is (Section, list_of_children)
+                section, children = item
+                if hasattr(section, 'title') and hasattr(section, 'href'):
+                    toc_entries.append((section.title, section.href, level))
+                for child in children:
+                    process_toc_item(child, level + 1)
+            elif isinstance(item, epub.Link):
+                # Item is a Link object
+                toc_entries.append((item.title, item.href, level))
+            elif hasattr(item, 'title') and hasattr(item, 'href'):
+                # Item has title and href attributes
+                toc_entries.append((item.title, item.href, level))
+        
+        # Process the table of contents
+        toc = book.toc
+        if toc:
+            for item in toc:
+                process_toc_item(item)
+        
+        self.log(f"Extracted {len(toc_entries)} TOC entries")
+        return toc_entries
     
     def process_html_content(self, html_content: str, base_path: str = "") -> str:
         """
@@ -304,7 +387,7 @@ class EPUBConverter:
         
         Args:
             html_content: Raw HTML content
-            base_path: Base path for resolving relative URLs
+            base_path: Base path for resolving relative URLs (unused but kept for compatibility)
             
         Returns:
             Processed HTML string
@@ -315,13 +398,17 @@ class EPUBConverter:
         for tag in soup.find_all(['script', 'style']):
             tag.decompose()
         
-        # Fix image paths if needed
+        # Fix image paths - keep them relative to the HTML file location
+        # Images are extracted preserving their directory structure, so we just
+        # need to ensure the paths are clean and use forward slashes
         for img in soup.find_all('img'):
             src = img.get('src', '')
             if src and not src.startswith(('http://', 'https://', 'data:')):
-                # Convert relative paths
-                if base_path:
-                    img['src'] = os.path.join(base_path, src).replace('\\', '/')
+                # Clean up the path - remove leading slashes and '../' patterns
+                # but keep the relative path structure (e.g., "images/foo.jpg")
+                clean_src = src.lstrip('./').lstrip('/')
+                # Normalize to forward slashes for web compatibility
+                img['src'] = clean_src.replace('\\', '/')
         
         return str(soup)
     
@@ -332,7 +419,8 @@ class EPUBConverter:
         page_size: str = 'A4',
         margins: int = 20,
         font_size: int = 12,
-        include_toc: bool = True
+        include_toc: bool = True,
+        preserve_temp: bool = None
     ) -> bool:
         """
         Convert EPUB to PDF.
@@ -344,6 +432,7 @@ class EPUBConverter:
             margins: Margin size in mm
             font_size: Base font size in pt
             include_toc: Include table of contents
+            preserve_temp: Preserve temporary HTML files in temp_html folder
             
         Returns:
             True if successful, False otherwise
@@ -367,9 +456,56 @@ class EPUBConverter:
             # Extract metadata
             metadata = self.extract_metadata(book)
             
+            # Extract table of contents if requested
+            toc_entries = []
+            if include_toc:
+                toc_entries = self.extract_toc(book)
+            
+            # Determine if we should preserve temp files
+            if preserve_temp is None:
+                preserve_temp = self.preserve_temp
+            
             # Create temporary directory for extraction
-            self.temp_dir = tempfile.mkdtemp()
-            self.log(f"Created temporary directory: {self.temp_dir}")
+            if preserve_temp:
+                # Create temp_html directory next to output file
+                output_dir = os.path.dirname(os.path.abspath(output_path))
+                self.temp_dir = os.path.join(output_dir, 'temp_html')
+                os.makedirs(self.temp_dir, exist_ok=True)
+                self.log(f"Created temp_html directory: {self.temp_dir}")
+            else:
+                self.temp_dir = tempfile.mkdtemp()
+                self.log(f"Created temporary directory: {self.temp_dir}")
+            
+            # Extract images first and build image map
+            self.log("Extracting images...")
+            image_map = {}
+            image_count = 0
+            
+            # Extract regular images
+            for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+                img_name = item.get_name()
+                img_path = os.path.join(self.temp_dir, img_name)
+                os.makedirs(os.path.dirname(img_path), exist_ok=True)
+                with open(img_path, 'wb') as img_file:
+                    img_file.write(item.get_content())
+                # Store mapping of original path to extracted path
+                image_map[img_name] = img_path
+                # Also store without leading path components for flexibility
+                image_map[img_name.lstrip('./')] = img_path
+                image_count += 1
+            
+            # Also extract cover images (they have a different type)
+            for item in book.get_items_of_type(ebooklib.ITEM_COVER):
+                img_name = item.get_name()
+                img_path = os.path.join(self.temp_dir, img_name)
+                os.makedirs(os.path.dirname(img_path), exist_ok=True)
+                with open(img_path, 'wb') as img_file:
+                    img_file.write(item.get_content())
+                image_map[img_name] = img_path
+                image_map[img_name.lstrip('./')] = img_path
+                image_count += 1
+            
+            self.log(f"Extracted {image_count} images")
             
             # Build HTML content
             self.log("Building HTML content...")
@@ -388,8 +524,35 @@ class EPUBConverter:
                 html_parts.append('</div>')
                 html_parts.append('<div style="page-break-after: always;"></div>')
             
-            # Process documents in reading order
-            items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+            # Add table of contents if requested and entries exist
+            if include_toc and toc_entries:
+                html_parts.append('<div class="toc-page">')
+                html_parts.append('<h2 class="toc-title">Table of Contents</h2>')
+                html_parts.append('<ul class="toc-list">')
+                for title, href, level in toc_entries:
+                    # Clean href to create an anchor ID
+                    anchor_id = href.replace('/', '_').replace('.', '_').replace('#', '_').replace('.xhtml', '').replace('.html', '')
+                    # Escape HTML entities in title
+                    from html import escape
+                    safe_title = escape(title)
+                    html_parts.append(f'<li class="toc-level-{level}"><a href="#{anchor_id}">{safe_title}</a></li>')
+                html_parts.append('</ul>')
+                html_parts.append('</div>')
+            
+            # Create mapping of file names to anchor IDs for linking
+            anchor_map = {}
+            if include_toc and toc_entries:
+                for title, href, level in toc_entries:
+                    # Extract filename from href (before any # anchor)
+                    filename = href.split('#')[0]
+                    anchor_id = href.replace('/', '_').replace('.', '_').replace('#', '_').replace('.xhtml', '').replace('.html', '')
+                    anchor_map[filename] = anchor_id
+            
+            # Process documents in reading order, but skip navigation/TOC documents
+            all_items = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+            # Filter out navigation items (toc.xhtml, nav.xhtml, etc.) to avoid duplicate TOCs
+            # Check both the type and the class name since EpubNav items still have ITEM_DOCUMENT type
+            items = [item for item in all_items if type(item).__name__ != 'EpubNav']
             total_items = len(items)
             
             for idx, item in enumerate(items, 1):
@@ -399,17 +562,27 @@ class EPUBConverter:
                 
                 try:
                     content = item.get_content().decode('utf-8')
-                    processed_content = self.process_html_content(content)
+                    processed_content = self.process_html_content(content, self.temp_dir)
                     
                     # Extract body content
                     soup = BeautifulSoup(processed_content, 'html.parser')
                     body = soup.find('body')
                     
                     if body:
-                        # Add chapter class to first heading if exists
-                        first_heading = body.find(['h1', 'h2', 'h3'])
-                        if first_heading and 'class' not in first_heading.attrs:
-                            first_heading['class'] = first_heading.get('class', []) + ['chapter']
+                        # Add anchor ID to first heading if this file is in the TOC
+                        item_name = item.get_name()
+                        if include_toc and item_name in anchor_map:
+                            first_heading = body.find(['h1', 'h2', 'h3'])
+                            if first_heading:
+                                # Add anchor ID for TOC linking
+                                first_heading['id'] = anchor_map[item_name]
+                                # Add chapter class
+                                first_heading['class'] = first_heading.get('class', []) + ['chapter']
+                        else:
+                            # Just add chapter class to first heading if exists
+                            first_heading = body.find(['h1', 'h2', 'h3'])
+                            if first_heading and 'class' not in first_heading.attrs:
+                                first_heading['class'] = first_heading.get('class', []) + ['chapter']
                         
                         html_parts.append(str(body))
                     else:
@@ -423,18 +596,6 @@ class EPUBConverter:
             
             html_parts.append('</body></html>')
             html_content = '\n'.join(html_parts)
-            
-            # Save images to temp directory
-            self.log("Extracting images...")
-            image_count = 0
-            for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
-                img_path = os.path.join(self.temp_dir, item.get_name())
-                os.makedirs(os.path.dirname(img_path), exist_ok=True)
-                with open(img_path, 'wb') as img_file:
-                    img_file.write(item.get_content())
-                image_count += 1
-            
-            self.log(f"Extracted {image_count} images")
             
             # Save HTML to temp file
             html_file_path = os.path.join(self.temp_dir, 'book.html')
@@ -461,6 +622,10 @@ class EPUBConverter:
             self.log(f"PDF generated successfully: {output_path}")
             print(f"✓ Conversion successful: {output_path}")
             
+            # Show temp_html location if preserved
+            if preserve_temp:
+                print(f"📁 Temporary HTML files preserved in: {self.temp_dir}")
+            
             return True
             
         except Exception as e:
@@ -471,8 +636,11 @@ class EPUBConverter:
             return False
             
         finally:
-            # Clean up temp directory
-            if self.temp_dir and os.path.exists(self.temp_dir):
+            # Clean up temp directory (unless preserve_temp is enabled)
+            if preserve_temp is None:
+                preserve_temp = self.preserve_temp
+            
+            if not preserve_temp and self.temp_dir and os.path.exists(self.temp_dir):
                 try:
                     shutil.rmtree(self.temp_dir)
                     self.log("Cleaned up temporary files")
@@ -604,6 +772,12 @@ Examples:
     )
     
     parser.add_argument(
+        '--preserve-temp',
+        action='store_true',
+        help='Preserve temporary HTML files in temp_html folder for debugging'
+    )
+    
+    parser.add_argument(
         '--version',
         action='version',
         version='%(prog)s 1.0'
@@ -612,7 +786,7 @@ Examples:
     args = parser.parse_args()
     
     # Create converter
-    converter = EPUBConverter(verbose=args.verbose)
+    converter = EPUBConverter(verbose=args.verbose, preserve_temp=args.preserve_temp)
     
     # Check if batch conversion
     if len(args.epub_files) > 1 or args.output_dir:
